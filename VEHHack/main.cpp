@@ -33,13 +33,80 @@ typedef struct BASE_RELOCATION_ENTRY {
 	USHORT Type : 4;
 } BASE_RELOCATION_ENTRY, * PBASE_RELOCATION_ENTRY;
 
-VOID InitWinAPI() {
-	NtOpenSection = (fnNtOpenSection)GetProcAddress(hNtdll, "NtOpenSection");
-	NtCreateSection = (fnNtCreateSection)GetProcAddress(hNtdll, "NtCreateSection");
-	NtMapViewOfSection = (fnNtMapViewOfSection)GetProcAddress(hNtdll, "NtMapViewOfSection");
-	RtlImageNtHeader = (fnRtlImageNtHeader)GetProcAddress(hNtdll, "RtlImageNtHeader");
-	NtContinue = (fnNtContinue)GetProcAddress(hNtdll, "NtContinue");
+VOID* MyGetProcAddress(_In_ HMODULE hModule, _In_ LPCSTR lpProcName);
+
+BOOL CheckForwardedExport(_In_ DWORD RVA, _In_ IMAGE_OPTIONAL_HEADER OptHeader) {
+	return  (RVA >= OptHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress
+		&& RVA < OptHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress + OptHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size);
 }
+
+VOID* ForwardedExport(_In_ const CHAR* pForwardStr) {
+	const CHAR* dot = strchr(pForwardStr, '.');
+	CHAR pDll[MAX_PATH] = { 0 };
+	CHAR pFunctionName[MAX_PATH] = { 0 };
+	memcpy(pDll, pForwardStr, dot - pForwardStr);
+	strcat_s(pDll, MAX_PATH, ".dll");
+	strcpy_s(pFunctionName, MAX_PATH, dot + 1);
+
+	HMODULE hMod = LoadLibraryA(pDll);
+
+	//Ordinal forwarded export 
+	if (pFunctionName[0] == '#') {
+		WORD ord = (WORD)atoi(pFunctionName + 1);
+		return MyGetProcAddress(hMod, (LPCSTR)ord);
+	}
+
+	return MyGetProcAddress(hMod, pFunctionName);
+}
+
+VOID* MyGetProcAddress(_In_ HMODULE hModule, _In_ LPCSTR lpProcName) {
+	BYTE* pBase = (BYTE*)hModule;
+	PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)pBase;
+	PIMAGE_NT_HEADERS64 pNtHeaer = (PIMAGE_NT_HEADERS)(pBase + pDosHeader->e_lfanew);
+	IMAGE_OPTIONAL_HEADER64 OptHeader = pNtHeaer->OptionalHeader;
+	IMAGE_FILE_HEADER FileHeader = pNtHeaer->FileHeader;
+
+	PIMAGE_EXPORT_DIRECTORY ExportDir = (PIMAGE_EXPORT_DIRECTORY)(pBase + OptHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+	DWORD* pdwNameAddr = (DWORD*)(pBase + ExportDir->AddressOfNames);
+	DWORD* pdwFunctions = (DWORD*)(pBase + ExportDir->AddressOfFunctions);
+	WORD* pwOrdinals = (WORD*)(pBase + ExportDir->AddressOfNameOrdinals);
+
+	// find function by ordinal
+	if ((ULONG_PTR)lpProcName <= 0xFFFF) {
+		WORD wOrg = (WORD)lpProcName - ExportDir->Base;
+		DWORD dwFunctionRVA = pdwFunctions[wOrg];
+		if (CheckForwardedExport(dwFunctionRVA, OptHeader)) {
+			return ForwardedExport((const CHAR*)(dwFunctionRVA + pBase));
+		}
+		return (VOID*)(pBase + dwFunctionRVA);
+	}
+
+	// find function by name
+	for (int i = 0; i < ExportDir->NumberOfNames; i++) {
+		CHAR* pFuncName = (CHAR*)(pBase + pdwNameAddr[i]);
+		if (!strcmp(pFuncName, lpProcName)) {
+			WORD ordinal = pwOrdinals[i];
+			DWORD dwFunctionRVA = pdwFunctions[ordinal];
+
+			if (CheckForwardedExport(dwFunctionRVA, OptHeader)) {
+				return ForwardedExport((const CHAR*)(dwFunctionRVA + pBase));
+			}
+
+			return (VOID*)(pBase + dwFunctionRVA);
+		}
+	}
+	return nullptr;
+}
+
+VOID InitWinAPI() {
+	NtOpenSection = (fnNtOpenSection)MyGetProcAddress(hNtdll, "NtOpenSection");
+	NtCreateSection = (fnNtCreateSection)MyGetProcAddress(hNtdll, "NtCreateSection");
+	NtMapViewOfSection = (fnNtMapViewOfSection)MyGetProcAddress(hNtdll, "NtMapViewOfSection");
+	RtlImageNtHeader = (fnRtlImageNtHeader)MyGetProcAddress(hNtdll, "RtlImageNtHeader");
+	NtContinue = (fnNtContinue)MyGetProcAddress(hNtdll, "NtContinue");
+}
+
 
 DWORD RvaToFoa(DWORD rva, PIMAGE_NT_HEADERS nt)
 {
