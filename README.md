@@ -1,5 +1,5 @@
 # 中文文档
-中文请参考https://blog.csdn.net/lec2022/article/details/157062663或https://bbs.kanxue.com/thread-289786-1.htm
+中文请参考https://blog.csdn.net/lec2022/article/details/157062663 或 https://bbs.kanxue.com/thread-289786-1.htm
 一种基于VEH硬件断点的Ldr劫持技术，通过在NtOpenSection和NtMapViewOfSection处下断点，转跳到VEH异常处理函数，劫持LoadLibrary。
 本项目仅用于思路验证
 
